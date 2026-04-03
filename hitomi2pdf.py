@@ -10,7 +10,7 @@ from typing import Dict
 from tqdm.asyncio import tqdm
 from functools import wraps
 from PIL import Image
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
 # --- RETRY DECORATOR ---
 def retry_on_failure(max_retries=3, base_delay=1):
@@ -92,11 +92,9 @@ class Hitomi2PDF:
                     }
                 """)
                 
-                await browser.close()
                 return metadata
-            except Exception as e:
+            finally:
                 await browser.close()
-                raise Exception(f"Playwright error: {e}")
 
     @retry_on_failure(max_retries=3, base_delay=1)
     async def _fetch_image(self, session, url, headers, path):
@@ -146,7 +144,7 @@ class Hitomi2PDF:
             if not meta.get("files"):
                 print("[!] No files found. Gallery may be empty or invalid.")
                 return False
-        except Exception as e:
+        except (PlaywrightError, PlaywrightTimeoutError) as e:
             print(f"[!] Rendering Error: {e}")
             print("[TIP] Make sure you have run: python -m playwright install chromium")
             return False
