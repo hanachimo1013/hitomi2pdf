@@ -243,7 +243,7 @@ class Hitomi2PDF:
                     resolution=100.0, 
                     quality=90
                 )
-            except Exception as e:
+            except (OSError, ValueError) as e:
                 print(f"[!] PDF Compilation Error: {e}")
                 shutil.rmtree(temp_path)
                 return False
