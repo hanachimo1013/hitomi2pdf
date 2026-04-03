@@ -28,7 +28,7 @@ def retry_on_failure(max_retries=3, base_delay=1):
     return decorator
 
 class Hitomi2PDF:
-    def __init__(self, output_dir="outputs", concurrency_limit=5):
+    def __init__(self, output_dir="outputs", concurrency_limit=5, target_width=1600, target_height=2260):
         self.base_url = "https://hitomi.la"
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -36,6 +36,8 @@ class Hitomi2PDF:
         self.semaphore = asyncio.Semaphore(concurrency_limit)
         
         self.output_dir = output_dir
+        self.target_width = target_width
+        self.target_height = target_height
         try:
             os.makedirs(self.output_dir, exist_ok=True)
         except OSError as e:
@@ -198,8 +200,8 @@ class Hitomi2PDF:
 
         final_filename = os.path.join(self.output_dir, f"{gallery_id}_{title}.pdf")
         
-        print(f"[*] Normalizing and Compiling (1600x2260)...")
-        TARGET_W, TARGET_H = 1600, 2260 
+        print(f"[*] Normalizing and Compiling ({self.target_width}x{self.target_height})...")
+        TARGET_W, TARGET_H = self.target_width, self.target_height
         processed_img_files = []
 
         for img_path in img_files:
