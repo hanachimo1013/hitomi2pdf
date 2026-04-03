@@ -9,11 +9,35 @@ import shutil
 from typing import Dict
 from tqdm.asyncio import tqdm
 from functools import wraps
+import concurrent.futures
 from PIL import Image
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
+
+def process_image(img_path, target_w=1600, target_h=2260):
+    try:
+        # Pillow might need pillow-avif-plugin for .avif files
+        with Image.open(img_path) as img:
+            img = img.convert('RGB')
+            ratio = min(target_w / img.width, target_h / img.height)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            resized_img = img.resize(new_size, Image.Resampling.LANCZOS)
+            canvas = Image.new('RGB', (target_w, target_h), (255, 255, 255))
+            canvas.paste(resized_img, ((target_w - new_size[0]) // 2, (target_h - new_size[1]) // 2))
+
+            proc_path = img_path + ".jpg" # Save as intermediate JPG
+            canvas.save(proc_path, "JPEG", quality=90)
+
+            # Prevent memory ballooning by explicitly releasing image buffers
+            img.close()
+            resized_img.close()
+            canvas.close()
+            return proc_path
+    except Exception as e:
+        print(f"[!] Error processing {img_path}: {e}")
+        return None
 
 # --- RETRY DECORATOR ---
-def retry_on_failure(max_retries=3, base_delay=1):
+def retry_on_failure(max_retries=5, base_delay=2):
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -28,7 +52,7 @@ def retry_on_failure(max_retries=3, base_delay=1):
     return decorator
 
 class Hitomi2PDF:
-    def __init__(self, output_dir="outputs", concurrency_limit=5):
+    def __init__(self, output_dir="outputs", concurrency_limit=5, target_width=1600, target_height=2260):
         self.base_url = "https://hitomi.la"
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -36,9 +60,11 @@ class Hitomi2PDF:
         self.semaphore = asyncio.Semaphore(concurrency_limit)
         
         self.output_dir = output_dir
+        self.target_width = target_width
+        self.target_height = target_height
         try:
             os.makedirs(self.output_dir, exist_ok=True)
-        except Exception as e:
+        except OSError as e:
             print(f"[*] Target directory '{self.output_dir}' inaccessible: {e}. Falling back to 'outputs'.")
             self.output_dir = "outputs"
             os.makedirs(self.output_dir, exist_ok=True)
@@ -92,13 +118,11 @@ class Hitomi2PDF:
                     }
                 """)
                 
-                await browser.close()
                 return metadata
-            except Exception as e:
+            finally:
                 await browser.close()
-                raise Exception(f"Playwright error: {e}")
 
-    @retry_on_failure(max_retries=3, base_delay=1)
+    @retry_on_failure(max_retries=5, base_delay=2)
     async def _fetch_image(self, session, url, headers, path):
         if not url: return False
         async with session.get(url, headers=headers, timeout=15) as resp:
@@ -109,13 +133,18 @@ class Hitomi2PDF:
                 async with aiofiles.open(path, "wb") as f:
                     await f.write(content)
                 return True
+            elif resp.status in [403, 429, 500, 502, 503, 504]:
+                print(f"[~] Rate limited ({resp.status}) on {url.split('/')[-1]}, retrying...")
+                resp.raise_for_status()
             else:
                 # Print specifically for 404 or other errors to see which files are failing
                 if resp.status != 404:
                     print(f"\n[!] Error ({resp.status}) requesting: {url}")
             return False
 
-    async def download_page(self, session, gallery_id, index, img_data, temp_path):
+    async def download_page(self, session, gallery_id, index, img_data, temp_path, delay=0):
+        if delay > 0:
+            await asyncio.sleep(delay)
         async with self.semaphore:
             headers = self.headers.copy()
             safe_gallery_id = re.sub(r'\D', '', str(gallery_id))
@@ -144,9 +173,8 @@ class Hitomi2PDF:
             meta = await self.get_rendered_metadata(gallery_id)
             if not meta.get("files"):
                 print("[!] No files found. Gallery may be empty or invalid.")
-                return None
-            return meta
-        except Exception as e:
+                return False
+        except (PlaywrightError, PlaywrightTimeoutError) as e:
             print(f"[!] Rendering Error: {e}")
             print("[TIP] Make sure you have run: python -m playwright install chromium")
             return None
@@ -156,7 +184,10 @@ class Hitomi2PDF:
             async with aiohttp.ClientSession() as session:
                 tasks = []
                 for index, img_data in enumerate(files, 1):
-                    tasks.append(self.download_page(session, gallery_id, index, img_data, temp_path))
+                    # Optimized to theoretical Cloudflare WAF throttle curve (~3 req/s)
+                    delay = (index - 1) * 0.33
+                    # We wrap in create_task so they boot instantly with internal sleep
+                    tasks.append(asyncio.create_task(self.download_page(session, gallery_id, index, img_data, temp_path, delay)))
                 
                 await tqdm.gather(*tasks, desc=f"Progress [{gallery_id}]", unit="pg")
 
@@ -178,34 +209,20 @@ class Hitomi2PDF:
             print(f"\n[!] WARNING: Integrity check failed. {failed} page(s) failed to download.")
             print(f"[*] Attempting to proceed with {len(img_files)} pages...")
 
-        return img_files
-
-    def _process_images(self, img_files: list) -> list:
-        print(f"[*] Normalizing and Compiling (1600x2260)...")
-        TARGET_W, TARGET_H = 1600, 2260 
+        final_filename = os.path.join(self.output_dir, f"{gallery_id}_{title}.pdf")
+        
+        print(f"[*] Normalizing and Compiling ({self.target_width}x{self.target_height})...")
+        TARGET_W, TARGET_H = self.target_width, self.target_height
         processed_img_files = []
 
-        for img_path in img_files:
-            try:
-                # Pillow might need pillow-avif-plugin for .avif files
-                with Image.open(img_path) as img:
-                    img = img.convert('RGB')
-                    ratio = min(TARGET_W / img.width, TARGET_H / img.height)
-                    new_size = (int(img.width * ratio), int(img.height * ratio))
-                    resized_img = img.resize(new_size, Image.Resampling.LANCZOS)
-                    canvas = Image.new('RGB', (TARGET_W, TARGET_H), (255, 255, 255))
-                    canvas.paste(resized_img, ((TARGET_W - new_size[0]) // 2, (TARGET_H - new_size[1]) // 2))
-                    
-                    proc_path = img_path + ".jpg" # Save as intermediate JPG
-                    canvas.save(proc_path, "JPEG", quality=90)
-                    processed_img_files.append(proc_path)
-                    
-                    # Prevent memory ballooning by explicitly releasing image buffers
-                    img.close()
-                    resized_img.close()
-                    canvas.close()
-            except Exception as e:
-                print(f"[!] Error processing {img_path}: {e}")
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            tasks = [loop.run_in_executor(executor, process_image, img_path) for img_path in img_files]
+            results = await tqdm.gather(*tasks, desc="Processing images", unit="img")
+
+            for res in results:
+                if res:
+                    processed_img_files.append(res)
 
         return processed_img_files
 
@@ -242,14 +259,29 @@ class Hitomi2PDF:
     def _inject_metadata_sync(self, final_filename: str, title: str, tags: list, gallery_id: str) -> bool:
         if os.path.exists(final_filename):
             try:
-                with pikepdf.open(final_filename, allow_overwriting_input=True) as pdf:
-                    with pdf.open_metadata() as pdf_meta:
-                        pdf_meta['dc:title'] = f"{title}"
-                        pdf_meta['dc:subject'] = tags + ["Hitomi", gallery_id]
-                    pdf.save(final_filename, linearize=True)
-                return True
-            except Exception as e:
-                print(f"[!] Warning: Failed to inject metadata: {e}")
+                # Re-sort to ensure correct PDF order
+                processed_img_files.sort()
+                first_img = Image.open(processed_img_files[0])
+                for p in processed_img_files[1:]:
+                    images.append(Image.open(p))
+                    
+                if os.path.exists(final_filename):
+                    try:
+                        os.remove(final_filename)
+                        print(f"[*] Overwriting existing file: {os.path.basename(final_filename)}")
+                    except OSError as e:
+                        print(f"[!] Target file exists but is locked/cannot be overwritten: {e}")
+                        
+                first_img.save(
+                    final_filename, 
+                    save_all=True, 
+                    append_images=images, 
+                    resolution=100.0, 
+                    quality=90
+                )
+            except (OSError, ValueError) as e:
+                print(f"[!] PDF Compilation Error: {e}")
+                shutil.rmtree(temp_path)
                 return False
         else:
             print(f"[!] Warning: File not found for metadata injection: {final_filename}")
