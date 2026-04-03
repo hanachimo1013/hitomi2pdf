@@ -3,6 +3,7 @@ import re
 import asyncio
 import random
 import aiohttp
+import aiofiles
 import pikepdf
 import shutil
 from typing import Dict
@@ -105,8 +106,8 @@ class Hitomi2PDF:
                 content = await resp.read()
                 if len(content) < 500: # Sanity check for too small files (junk)
                     return False
-                with open(path, "wb") as f:
-                    f.write(content)
+                async with aiofiles.open(path, "wb") as f:
+                    await f.write(content)
                 return True
             else:
                 # Print specifically for 404 or other errors to see which files are failing
