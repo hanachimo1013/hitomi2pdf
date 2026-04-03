@@ -161,8 +161,8 @@ class Hitomi2PDF:
         print(f"  VOLUME   : {total_pages} Pages")
         print("=" * 60)
         
-        confirm = input(f"Compile this entry? [Enter to Continue / n to Cancel]: ").lower()
-        if confirm == 'n':
+        confirm = await asyncio.to_thread(input, f"Compile this entry? [Enter to Continue / n to Cancel]: ")
+        if confirm.lower() == 'n':
             print("[!] Operation scrubbed.")
             return False
 
