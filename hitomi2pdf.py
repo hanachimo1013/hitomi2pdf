@@ -1,13 +1,11 @@
 import os
-import json
 import re
 import asyncio
 import random
 import aiohttp
 import pikepdf
 import shutil
-import sys
-from typing import List, Dict
+from typing import Dict
 from tqdm.asyncio import tqdm
 from functools import wraps
 from PIL import Image
@@ -29,37 +27,20 @@ def retry_on_failure(max_retries=3, base_delay=1):
     return decorator
 
 class Hitomi2PDF:
-    def __init__(self, output_dir=r"G:\My Drive\Luxurious Chest\Doujin Archives", concurrency_limit=5):
+    def __init__(self, output_dir="outputs", concurrency_limit=5):
         self.base_url = "https://hitomi.la"
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         }
         self.semaphore = asyncio.Semaphore(concurrency_limit)
         
-        # Determine output directory with aggressive fallback
-        final_dir = output_dir
-        fallback = False
-        
+        self.output_dir = output_dir
         try:
-            drive = os.path.splitdrive(os.path.abspath(final_dir))[0]
-            if drive and not os.path.exists(drive + os.sep):
-                fallback = True
-            else:
-                os.makedirs(final_dir, exist_ok=True)
-                test_file = os.path.join(final_dir, ".write_test")
-                with open(test_file, "w") as f:
-                    f.write("test")
-                os.remove(test_file)
-        except Exception:
-            fallback = True
-
-        if fallback:
+            os.makedirs(self.output_dir, exist_ok=True)
+        except Exception as e:
+            print(f"[*] Target directory '{self.output_dir}' inaccessible: {e}. Falling back to 'outputs'.")
             self.output_dir = "outputs"
             os.makedirs(self.output_dir, exist_ok=True)
-            if final_dir != "outputs":
-                print(f"[*] Target directory '{final_dir}' inaccessible. Falling back to '{self.output_dir}'.")
-        else:
-            self.output_dir = final_dir
 
     def _sanitize(self, text):
         return re.sub(r'[\\/*?:"<>|]', "", text).strip().replace(" ", "_")
@@ -160,10 +141,13 @@ class Hitomi2PDF:
         
         try:
             meta = await self.get_rendered_metadata(gallery_id)
+            if not meta.get("files"):
+                print("[!] No files found. Gallery may be empty or invalid.")
+                return False
         except Exception as e:
             print(f"[!] Rendering Error: {e}")
             print("[TIP] Make sure you have run: python -m playwright install chromium")
-            return
+            return False
 
         files = meta.get("files", [])
         raw_title = meta.get("title", f"Hitomi Gallery {gallery_id}")
@@ -179,7 +163,7 @@ class Hitomi2PDF:
         confirm = input(f"Compile this entry? [Enter to Continue / n to Cancel]: ").lower()
         if confirm == 'n':
             print("[!] Operation scrubbed.")
-            return
+            return False
 
         temp_path = f"temp_hitomi_{gallery_id}"
         os.makedirs(temp_path, exist_ok=True)
@@ -195,7 +179,7 @@ class Hitomi2PDF:
         except Exception as e:
             print(f"[!] Network error: {e}")
             shutil.rmtree(temp_path)
-            return
+            return False
 
         img_files = []
         for f in sorted(os.listdir(temp_path)):
@@ -205,7 +189,7 @@ class Hitomi2PDF:
         if not img_files:
             print("[!] No images downloaded. Aborting compilation.")
             shutil.rmtree(temp_path)
-            return
+            return False
 
         if len(img_files) < total_pages:
             failed = total_pages - len(img_files)
@@ -232,26 +216,40 @@ class Hitomi2PDF:
                     proc_path = img_path + ".jpg" # Save as intermediate JPG
                     canvas.save(proc_path, "JPEG", quality=90)
                     processed_img_files.append(proc_path)
+                    
+                    # Prevent memory ballooning by explicitly releasing image buffers
+                    img.close()
+                    resized_img.close()
+                    canvas.close()
             except Exception as e:
                 print(f"[!] Error processing {img_path}: {e}")
 
         if processed_img_files:
+            images = []
+            first_img = None
             try:
                 # Re-sort to ensure correct PDF order
                 processed_img_files.sort()
                 first_img = Image.open(processed_img_files[0])
+                for p in processed_img_files[1:]:
+                    images.append(Image.open(p))
+                    
                 first_img.save(
                     final_filename, 
                     save_all=True, 
-                    append_images=(Image.open(p) for p in processed_img_files[1:]), 
+                    append_images=images, 
                     resolution=100.0, 
                     quality=90
                 )
-                first_img.close()
             except Exception as e:
                 print(f"[!] PDF Compilation Error: {e}")
                 shutil.rmtree(temp_path)
-                return
+                return False
+            finally:
+                if first_img:
+                    first_img.close()
+                for i in images:
+                    i.close()
         
         print(f"[*] Finalizing metadata and linearization...")
         for attempt in range(5):
@@ -278,18 +276,4 @@ class Hitomi2PDF:
         print(f"      Archive completed: {os.path.basename(final_filename)}")
         print(f"      Location: {self.output_dir}")
         print("=" * 60)
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python hitomi2pdf.py <gallery_id>")
-    else:
-        gallery_id = sys.argv[1]
-        try:
-            asyncio.run(Hitomi2PDF().execute(gallery_id))
-        except KeyboardInterrupt:
-            print("\n[!] Emergency Stop.")
-        except Exception as e:
-            print(f"\n[!] Critical System Error: {e}")
-
-if __name__ == "__main__":
-    main()
+        return True

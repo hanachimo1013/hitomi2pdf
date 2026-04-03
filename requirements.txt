@@ -1,6 +1,0 @@
-aiohttp
-pikepdf
-tqdm
-Pillow
-pillow-avif-plugin
-playwright
