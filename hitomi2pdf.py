@@ -13,7 +13,7 @@ from PIL import Image
 from playwright.async_api import async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
 # --- RETRY DECORATOR ---
-def retry_on_failure(max_retries=3, base_delay=1):
+def retry_on_failure(max_retries=5, base_delay=2):
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -98,7 +98,7 @@ class Hitomi2PDF:
             finally:
                 await browser.close()
 
-    @retry_on_failure(max_retries=3, base_delay=1)
+    @retry_on_failure(max_retries=5, base_delay=2)
     async def _fetch_image(self, session, url, headers, path):
         if not url: return False
         async with session.get(url, headers=headers, timeout=15) as resp:
@@ -109,13 +109,18 @@ class Hitomi2PDF:
                 async with aiofiles.open(path, "wb") as f:
                     await f.write(content)
                 return True
+            elif resp.status in [403, 429, 500, 502, 503, 504]:
+                print(f"[~] Rate limited ({resp.status}) on {url.split('/')[-1]}, retrying...")
+                resp.raise_for_status()
             else:
                 # Print specifically for 404 or other errors to see which files are failing
                 if resp.status != 404:
                     print(f"\n[!] Error ({resp.status}) requesting: {url}")
             return False
 
-    async def download_page(self, session, gallery_id, index, img_data, temp_path):
+    async def download_page(self, session, gallery_id, index, img_data, temp_path, delay=0):
+        if delay > 0:
+            await asyncio.sleep(delay)
         async with self.semaphore:
             headers = self.headers.copy()
             safe_gallery_id = re.sub(r'\D', '', str(gallery_id))
@@ -174,7 +179,10 @@ class Hitomi2PDF:
             async with aiohttp.ClientSession() as session:
                 tasks = []
                 for index, img_data in enumerate(files, 1):
-                    tasks.append(self.download_page(session, gallery_id, index, img_data, temp_path))
+                    # Strict 0.5s visual stagger
+                    delay = (index - 1) * 0.5
+                    # We wrap in create_task so they boot instantly with internal sleep
+                    tasks.append(asyncio.create_task(self.download_page(session, gallery_id, index, img_data, temp_path, delay)))
                 
                 await tqdm.gather(*tasks, desc=f"Progress [{gallery_id}]", unit="pg")
 
@@ -236,6 +244,13 @@ class Hitomi2PDF:
                 for p in processed_img_files[1:]:
                     images.append(Image.open(p))
                     
+                if os.path.exists(final_filename):
+                    try:
+                        os.remove(final_filename)
+                        print(f"[*] Overwriting existing file: {os.path.basename(final_filename)}")
+                    except OSError as e:
+                        print(f"[!] Target file exists but is locked/cannot be overwritten: {e}")
+                        
                 first_img.save(
                     final_filename, 
                     save_all=True, 
