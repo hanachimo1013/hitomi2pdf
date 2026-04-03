@@ -179,8 +179,8 @@ class Hitomi2PDF:
             async with aiohttp.ClientSession() as session:
                 tasks = []
                 for index, img_data in enumerate(files, 1):
-                    # Strict 0.5s visual stagger
-                    delay = (index - 1) * 0.5
+                    # Optimized to theoretical Cloudflare WAF throttle curve (~3 req/s)
+                    delay = (index - 1) * 0.33
                     # We wrap in create_task so they boot instantly with internal sleep
                     tasks.append(asyncio.create_task(self.download_page(session, gallery_id, index, img_data, temp_path, delay)))
                 
