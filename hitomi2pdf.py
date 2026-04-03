@@ -117,7 +117,8 @@ class Hitomi2PDF:
     async def download_page(self, session, gallery_id, index, img_data, temp_path):
         async with self.semaphore:
             headers = self.headers.copy()
-            headers["Referer"] = f"{self.base_url}/reader/{gallery_id}.html"
+            safe_gallery_id = re.sub(r'\D', '', str(gallery_id))
+            headers["Referer"] = f"{self.base_url}/reader/{safe_gallery_id}.html"
 
             # Try AVIF first
             url_avif = img_data.get('avif_url')
