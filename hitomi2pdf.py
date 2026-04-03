@@ -38,7 +38,7 @@ class Hitomi2PDF:
         self.output_dir = output_dir
         try:
             os.makedirs(self.output_dir, exist_ok=True)
-        except Exception as e:
+        except OSError as e:
             print(f"[*] Target directory '{self.output_dir}' inaccessible: {e}. Falling back to 'outputs'.")
             self.output_dir = "outputs"
             os.makedirs(self.output_dir, exist_ok=True)
