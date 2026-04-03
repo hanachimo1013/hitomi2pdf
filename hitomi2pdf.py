@@ -9,8 +9,32 @@ import shutil
 from typing import Dict
 from tqdm.asyncio import tqdm
 from functools import wraps
+import concurrent.futures
 from PIL import Image
 from playwright.async_api import async_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
+
+def process_image(img_path, target_w=1600, target_h=2260):
+    try:
+        # Pillow might need pillow-avif-plugin for .avif files
+        with Image.open(img_path) as img:
+            img = img.convert('RGB')
+            ratio = min(target_w / img.width, target_h / img.height)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            resized_img = img.resize(new_size, Image.Resampling.LANCZOS)
+            canvas = Image.new('RGB', (target_w, target_h), (255, 255, 255))
+            canvas.paste(resized_img, ((target_w - new_size[0]) // 2, (target_h - new_size[1]) // 2))
+
+            proc_path = img_path + ".jpg" # Save as intermediate JPG
+            canvas.save(proc_path, "JPEG", quality=90)
+
+            # Prevent memory ballooning by explicitly releasing image buffers
+            img.close()
+            resized_img.close()
+            canvas.close()
+            return proc_path
+    except Exception as e:
+        print(f"[!] Error processing {img_path}: {e}")
+        return None
 
 # --- RETRY DECORATOR ---
 def retry_on_failure(max_retries=5, base_delay=2):
@@ -212,27 +236,14 @@ class Hitomi2PDF:
         TARGET_W, TARGET_H = self.target_width, self.target_height
         processed_img_files = []
 
-        for img_path in img_files:
-            try:
-                # Pillow might need pillow-avif-plugin for .avif files
-                with Image.open(img_path) as img:
-                    img = img.convert('RGB')
-                    ratio = min(TARGET_W / img.width, TARGET_H / img.height)
-                    new_size = (int(img.width * ratio), int(img.height * ratio))
-                    resized_img = img.resize(new_size, Image.Resampling.LANCZOS)
-                    canvas = Image.new('RGB', (TARGET_W, TARGET_H), (255, 255, 255))
-                    canvas.paste(resized_img, ((TARGET_W - new_size[0]) // 2, (TARGET_H - new_size[1]) // 2))
-                    
-                    proc_path = img_path + ".jpg" # Save as intermediate JPG
-                    canvas.save(proc_path, "JPEG", quality=90)
-                    processed_img_files.append(proc_path)
-                    
-                    # Prevent memory ballooning by explicitly releasing image buffers
-                    img.close()
-                    resized_img.close()
-                    canvas.close()
-            except Exception as e:
-                print(f"[!] Error processing {img_path}: {e}")
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            tasks = [loop.run_in_executor(executor, process_image, img_path) for img_path in img_files]
+            results = await tqdm.gather(*tasks, desc="Processing images", unit="img")
+
+            for res in results:
+                if res:
+                    processed_img_files.append(res)
 
         if processed_img_files:
             images = []
