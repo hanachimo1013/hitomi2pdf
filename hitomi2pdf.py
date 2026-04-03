@@ -176,7 +176,7 @@ class Hitomi2PDF:
                 for index, img_data in enumerate(files, 1):
                     tasks.append(self.download_page(session, gallery_id, index, img_data, temp_path))
                 
-                results = await tqdm.gather(*tasks, desc=f"Progress [{gallery_id}]", unit="pg")
+                await tqdm.gather(*tasks, desc=f"Progress [{gallery_id}]", unit="pg")
 
         except Exception as e:
             print(f"[!] Network error: {e}")
