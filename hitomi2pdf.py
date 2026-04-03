@@ -167,9 +167,8 @@ class Hitomi2PDF:
             # Final Fallback to Jpeg (original) if available in hash but rare on Hitomi
             return False
 
-    async def execute(self, gallery_id):
+    async def _fetch_metadata(self, gallery_id: str):
         print(f"\n[*] Querying Hitomi Gallery ID: {gallery_id} via DOM rendering...")
-        
         try:
             meta = await self.get_rendered_metadata(gallery_id)
             if not meta.get("files"):
@@ -178,27 +177,9 @@ class Hitomi2PDF:
         except (PlaywrightError, PlaywrightTimeoutError) as e:
             print(f"[!] Rendering Error: {e}")
             print("[TIP] Make sure you have run: python -m playwright install chromium")
-            return False
+            return None
 
-        files = meta.get("files", [])
-        raw_title = meta.get("title", f"Hitomi Gallery {gallery_id}")
-        title = self._sanitize(raw_title)
-        tags = [t.get('tag', '') for t in meta.get("tags", []) if isinstance(t, dict)]
-        
-        total_pages = len(files)
-        print("=" * 60)
-        print(f"  TARGET   : {title}")
-        print(f"  VOLUME   : {total_pages} Pages")
-        print("=" * 60)
-        
-        confirm = await asyncio.to_thread(input, f"Compile this entry? [Enter to Continue / n to Cancel]: ")
-        if confirm.lower() == 'n':
-            print("[!] Operation scrubbed.")
-            return False
-
-        temp_path = f"temp_hitomi_{gallery_id}"
-        os.makedirs(temp_path, exist_ok=True)
-
+    async def _download_images(self, gallery_id: str, files: list, temp_path: str, total_pages: int):
         try:
             async with aiohttp.ClientSession() as session:
                 tasks = []
@@ -212,8 +193,7 @@ class Hitomi2PDF:
 
         except Exception as e:
             print(f"[!] Network error: {e}")
-            shutil.rmtree(temp_path)
-            return False
+            return None
 
         img_files = []
         for f in sorted(os.listdir(temp_path)):
@@ -222,8 +202,7 @@ class Hitomi2PDF:
 
         if not img_files:
             print("[!] No images downloaded. Aborting compilation.")
-            shutil.rmtree(temp_path)
-            return False
+            return None
 
         if len(img_files) < total_pages:
             failed = total_pages - len(img_files)
@@ -245,9 +224,40 @@ class Hitomi2PDF:
                 if res:
                     processed_img_files.append(res)
 
-        if processed_img_files:
-            images = []
-            first_img = None
+        return processed_img_files
+
+    def _compile_pdf(self, processed_img_files: list, final_filename: str) -> bool:
+        if not processed_img_files:
+            return False
+
+        images = []
+        first_img = None
+        try:
+            # Re-sort to ensure correct PDF order
+            processed_img_files.sort()
+            first_img = Image.open(processed_img_files[0])
+            for p in processed_img_files[1:]:
+                images.append(Image.open(p))
+
+            first_img.save(
+                final_filename,
+                save_all=True,
+                append_images=images,
+                resolution=100.0,
+                quality=90
+            )
+            return True
+        except Exception as e:
+            print(f"[!] PDF Compilation Error: {e}")
+            return False
+        finally:
+            if first_img:
+                first_img.close()
+            for i in images:
+                i.close()
+
+    def _inject_metadata_sync(self, final_filename: str, title: str, tags: list, gallery_id: str) -> bool:
+        if os.path.exists(final_filename):
             try:
                 # Re-sort to ensure correct PDF order
                 processed_img_files.sort()
@@ -273,35 +283,69 @@ class Hitomi2PDF:
                 print(f"[!] PDF Compilation Error: {e}")
                 shutil.rmtree(temp_path)
                 return False
-            finally:
-                if first_img:
-                    first_img.close()
-                for i in images:
-                    i.close()
-        
+        else:
+            print(f"[!] Warning: File not found for metadata injection: {final_filename}")
+            return False
+
+    async def _finalize_pdf(self, final_filename: str, title: str, tags: list, gallery_id: str):
         print(f"[*] Finalizing metadata and linearization...")
         for attempt in range(5):
-            if os.path.exists(final_filename):
-                try:
-                    with pikepdf.open(final_filename, allow_overwriting_input=True) as pdf:
-                        with pdf.open_metadata() as pdf_meta:
-                            pdf_meta['dc:title'] = f"{title}"
-                            pdf_meta['dc:subject'] = tags + ["Hitomi", gallery_id]
-                        pdf.save(final_filename, linearize=True)
-                    break 
-                except Exception as e:
-                    if attempt == 4:
-                        print(f"[!] Warning: Failed to inject metadata: {e}")
-                    await asyncio.sleep(1)
-            else:
-                if attempt == 4:
-                    print(f"[!] Warning: File not found for metadata injection: {final_filename}")
+            success = await asyncio.to_thread(self._inject_metadata_sync, final_filename, title, tags, gallery_id)
+            if success:
+                break
+            if attempt < 4:
                 await asyncio.sleep(1)
+
+    async def execute(self, gallery_id):
+        meta = await self._fetch_metadata(gallery_id)
+        if not meta:
+            return False
+
+        files = meta.get("files", [])
+        raw_title = meta.get("title", f"Hitomi Gallery {gallery_id}")
+        title = self._sanitize(raw_title)
+        tags = [t.get('tag', '') for t in meta.get("tags", []) if isinstance(t, dict)]
         
-        shutil.rmtree(temp_path)
+        total_pages = len(files)
         print("=" * 60)
-        print(f"   -> Success: [{title}]")
-        print(f"      Archive completed: {os.path.basename(final_filename)}")
-        print(f"      Location: {self.output_dir}")
+        print(f"  TARGET   : {title}")
+        print(f"  VOLUME   : {total_pages} Pages")
         print("=" * 60)
-        return True
+
+        confirm = await asyncio.to_thread(input, f"Compile this entry? [Enter to Continue / n to Cancel]: ")
+        if confirm.lower() == 'n':
+            print("[!] Operation scrubbed.")
+            return False
+
+        temp_path = f"temp_hitomi_{gallery_id}"
+        os.makedirs(temp_path, exist_ok=True)
+
+        try:
+            img_files = await self._download_images(gallery_id, files, temp_path, total_pages)
+            if not img_files:
+                shutil.rmtree(temp_path)
+                return False
+
+            final_filename = os.path.join(self.output_dir, f"{gallery_id}_{title}.pdf")
+
+            processed_img_files = await asyncio.to_thread(self._process_images, img_files)
+
+            success = await asyncio.to_thread(self._compile_pdf, processed_img_files, final_filename)
+            if not success:
+                shutil.rmtree(temp_path)
+                return False
+
+            await self._finalize_pdf(final_filename, title, tags, gallery_id)
+
+            shutil.rmtree(temp_path)
+            print("=" * 60)
+            print(f"   -> Success: [{title}]")
+            print(f"      Archive completed: {os.path.basename(final_filename)}")
+            print(f"      Location: {self.output_dir}")
+            print("=" * 60)
+            return True
+        except Exception as e:
+            print(f"[!] Unexpected error during execution: {e}")
+            if os.path.exists(temp_path):
+                shutil.rmtree(temp_path)
+            return False
