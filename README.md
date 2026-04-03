@@ -45,7 +45,7 @@ python hitomi2pdf.py <gallery_id>
 * `hitomi2pdf.py`: The core architect script.
 * `requirements.txt`: Project dependencies list.
 * `temp_hitomi_XXXXXX/`: Temporary storage for raw images (auto-cleaned).
-* **Outputs:** Defaults to `G:\My Drive\Luxurious Chest\Doujin Archives`.
+* **Outputs:** Defaults to `./outputs`.
 
 ---
 *Created for the Luxurious Chest Collection. 😏*

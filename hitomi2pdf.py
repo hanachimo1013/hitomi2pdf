@@ -171,22 +171,23 @@ class Hitomi2PDF:
         print(f"\n[*] Querying Hitomi Gallery ID: {gallery_id} via DOM rendering...")
         try:
             meta = await self.get_rendered_metadata(gallery_id)
-            if not meta.get("files"):
+            if not meta or not meta.get("files"):
                 print("[!] No files found. Gallery may be empty or invalid.")
-                return False
+                return None
+            return meta
         except (PlaywrightError, PlaywrightTimeoutError) as e:
             print(f"[!] Rendering Error: {e}")
             print("[TIP] Make sure you have run: python -m playwright install chromium")
             return None
 
-    async def _download_images(self, gallery_id: str, files: list, temp_path: str, total_pages: int):
+    async def _download_images(self, gallery_id: str, files: list, temp_path: str):
+        total_pages = len(files)
         try:
             async with aiohttp.ClientSession() as session:
                 tasks = []
                 for index, img_data in enumerate(files, 1):
                     # Optimized to theoretical Cloudflare WAF throttle curve (~3 req/s)
                     delay = (index - 1) * 0.33
-                    # We wrap in create_task so they boot instantly with internal sleep
                     tasks.append(asyncio.create_task(self.download_page(session, gallery_id, index, img_data, temp_path, delay)))
                 
                 await tqdm.gather(*tasks, desc=f"Progress [{gallery_id}]", unit="pg")
@@ -207,33 +208,42 @@ class Hitomi2PDF:
         if len(img_files) < total_pages:
             failed = total_pages - len(img_files)
             print(f"\n[!] WARNING: Integrity check failed. {failed} page(s) failed to download.")
-            print(f"[*] Attempting to proceed with {len(img_files)} pages...")
+            print(f"[*] Proceeding with {len(img_files)} pages...")
 
-        final_filename = os.path.join(self.output_dir, f"{gallery_id}_{title}.pdf")
-        
-        print(f"[*] Normalizing and Compiling ({self.target_width}x{self.target_height})...")
-        TARGET_W, TARGET_H = self.target_width, self.target_height
+        return img_files
+
+    async def _process_images(self, img_files: list):
+        print(f"[*] Normalizing ({self.target_width}x{self.target_height})...")
         processed_img_files = []
-
         loop = asyncio.get_running_loop()
+        
         with concurrent.futures.ProcessPoolExecutor() as executor:
-            tasks = [loop.run_in_executor(executor, process_image, img_path) for img_path in img_files]
+            tasks = [
+                loop.run_in_executor(executor, process_image, img_path, self.target_width, self.target_height) 
+                for img_path in img_files
+            ]
             results = await tqdm.gather(*tasks, desc="Processing images", unit="img")
 
             for res in results:
                 if res:
                     processed_img_files.append(res)
-
+        
         return processed_img_files
 
     def _compile_pdf(self, processed_img_files: list, final_filename: str) -> bool:
         if not processed_img_files:
             return False
 
+        if os.path.exists(final_filename):
+            try:
+                os.remove(final_filename)
+                print(f"[*] Overwriting existing file: {os.path.basename(final_filename)}")
+            except OSError as e:
+                print(f"[!] Target file exists but is locked: {e}")
+
         images = []
         first_img = None
         try:
-            # Re-sort to ensure correct PDF order
             processed_img_files.sort()
             first_img = Image.open(processed_img_files[0])
             for p in processed_img_files[1:]:
@@ -257,34 +267,17 @@ class Hitomi2PDF:
                 i.close()
 
     def _inject_metadata_sync(self, final_filename: str, title: str, tags: list, gallery_id: str) -> bool:
-        if os.path.exists(final_filename):
-            try:
-                # Re-sort to ensure correct PDF order
-                processed_img_files.sort()
-                first_img = Image.open(processed_img_files[0])
-                for p in processed_img_files[1:]:
-                    images.append(Image.open(p))
-                    
-                if os.path.exists(final_filename):
-                    try:
-                        os.remove(final_filename)
-                        print(f"[*] Overwriting existing file: {os.path.basename(final_filename)}")
-                    except OSError as e:
-                        print(f"[!] Target file exists but is locked/cannot be overwritten: {e}")
-                        
-                first_img.save(
-                    final_filename, 
-                    save_all=True, 
-                    append_images=images, 
-                    resolution=100.0, 
-                    quality=90
-                )
-            except (OSError, ValueError) as e:
-                print(f"[!] PDF Compilation Error: {e}")
-                shutil.rmtree(temp_path)
-                return False
-        else:
-            print(f"[!] Warning: File not found for metadata injection: {final_filename}")
+        if not os.path.exists(final_filename):
+            return False
+        try:
+            with pikepdf.open(final_filename, allow_overwriting_input=True) as pdf:
+                with pdf.open_metadata() as pdf_meta:
+                    pdf_meta['dc:title'] = title
+                    pdf_meta['dc:subject'] = tags + ["Hitomi", str(gallery_id)]
+                pdf.save(final_filename, linearize=True)
+            return True
+        except Exception as e:
+            print(f"[!] Metadata Injection Error: {e}")
             return False
 
     async def _finalize_pdf(self, final_filename: str, title: str, tags: list, gallery_id: str):
@@ -292,9 +285,10 @@ class Hitomi2PDF:
         for attempt in range(5):
             success = await asyncio.to_thread(self._inject_metadata_sync, final_filename, title, tags, gallery_id)
             if success:
-                break
+                return True
             if attempt < 4:
                 await asyncio.sleep(1)
+        return False
 
     async def execute(self, gallery_id):
         meta = await self._fetch_metadata(gallery_id)
@@ -302,40 +296,38 @@ class Hitomi2PDF:
             return False
 
         files = meta.get("files", [])
-        raw_title = meta.get("title", f"Hitomi Gallery {gallery_id}")
-        title = self._sanitize(raw_title)
+        title = self._sanitize(meta.get("title", f"Hitomi Gallery {gallery_id}"))
         tags = [t.get('tag', '') for t in meta.get("tags", []) if isinstance(t, dict)]
         
-        total_pages = len(files)
         print("=" * 60)
         print(f"  TARGET   : {title}")
-        print(f"  VOLUME   : {total_pages} Pages")
+        print(f"  VOLUME   : {len(files)} Pages")
         print("=" * 60)
 
-        confirm = await asyncio.to_thread(input, f"Compile this entry? [Enter to Continue / n to Cancel]: ")
+        confirm = await asyncio.to_thread(input, "Compile this entry? [Enter/y to Continue, n to Cancel]: ")
         if confirm.lower() == 'n':
-            print("[!] Operation scrubbed.")
+            print("[!] Operation aborted.")
             return False
 
         temp_path = f"temp_hitomi_{gallery_id}"
         os.makedirs(temp_path, exist_ok=True)
 
         try:
-            img_files = await self._download_images(gallery_id, files, temp_path, total_pages)
+            img_files = await self._download_images(gallery_id, files, temp_path)
             if not img_files:
                 shutil.rmtree(temp_path)
                 return False
 
-            final_filename = os.path.join(self.output_dir, f"{gallery_id}_{title}.pdf")
-
-            processed_img_files = await asyncio.to_thread(self._process_images, img_files)
-
-            success = await asyncio.to_thread(self._compile_pdf, processed_img_files, final_filename)
-            if not success:
+            processed_img_files = await self._process_images(img_files)
+            if not processed_img_files:
                 shutil.rmtree(temp_path)
                 return False
 
-            await self._finalize_pdf(final_filename, title, tags, gallery_id)
+            final_filename = os.path.join(self.output_dir, f"{gallery_id}_{title}.pdf")
+            success = await asyncio.to_thread(self._compile_pdf, processed_img_files, final_filename)
+            
+            if success:
+                await self._finalize_pdf(final_filename, title, tags, gallery_id)
 
             shutil.rmtree(temp_path)
             print("=" * 60)
