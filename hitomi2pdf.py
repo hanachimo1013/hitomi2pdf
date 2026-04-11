@@ -197,9 +197,14 @@ class Hitomi2PDF:
             return None
 
         img_files = []
-        for f in sorted(os.listdir(temp_path)):
-            if f.lower().endswith(('.jpg', '.png', '.webp', '.gif', '.avif')):
+        for f in os.listdir(temp_path):
+            if re.match(r'^\d+\.(jpg|png|webp|gif|avif)$', f.lower()):
                 img_files.append(os.path.join(temp_path, f))
+
+        try:
+            img_files.sort(key=lambda x: int(re.search(r'(\d+)\.', os.path.basename(x)).group(1)))
+        except Exception:
+            img_files.sort()
 
         if not img_files:
             print("[!] No images downloaded. Aborting compilation.")
@@ -244,7 +249,8 @@ class Hitomi2PDF:
         images = []
         first_img = None
         try:
-            processed_img_files.sort()
+            # We skip re-sorting 'processed_img_files' here as tasks return in the exact original array order if mapped correctly.
+            # Wait, since tqdm.gather is used, results order is guaranteed to match tasks order!
             first_img = Image.open(processed_img_files[0])
             for p in processed_img_files[1:]:
                 images.append(Image.open(p))
